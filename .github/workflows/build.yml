@@ -1,0 +1,202 @@
+# Best-effort automation of Madeira's build chain.
+#
+# Place at: .github/workflows/build-madeira.yml  (in YOUR fork)
+#
+# WHAT THIS DOES automate reliably (sourced directly from the repo's own
+# build/*/build.sh scripts and build/dxmt-ios/README.md):
+#   - submodule checkout
+#   - llvm-mingw (prebuilt download)
+#   - LLVM 15.0.7 cross-built for iOS (two-stage)
+#   - GMP -> nettle -> GnuTLS (build/gnutls-ios/build.sh)
+#   - freetype (build/freetype-ios/build.sh)
+#   - DXMT PE side (meson) + unix side (build/dxmt-ios/build.sh)
+#   - ntdll-unix / wineserver / win32u-unix (build/*/build.sh)
+#   - VC++ runtime DLL extraction
+#   - unsigned .app -> hand-zipped .ipa (no committed Xcode scheme exists,
+#     so `xcodebuild archive` won't work out of the box -- this builds the
+#     "Madeira" target directly instead and packages the .ipa itself)
+#
+# WHAT IS UNVERIFIED (flagged inline, marked continue-on-error so the rest
+# of the pipeline still runs and you get partial artifacts to debug from):
+#   - wine/build-macos and wine/build-arm64ec ./configure flags. Neither
+#     Madeira's docs nor the wine fork itself document these. The flags
+#     below are adapted from FEX-Emu's own ARM64EC wiki recipe (written
+#     for Linux, not iOS) -- expect to have to fix this.
+#   - LLVM_TARGETS_TO_BUILD for the iOS DXMT stage. Set to AArch64;X86 to
+#     be safe/slow; airconv may need zero CPU backends (check upstream
+#     3Shain/DXMT's own build docs, which this fork's README doesn't cover).
+#
+# This produces an UNSIGNED ipa. Signing + install onto your phone still
+# needs your own Apple ID, done locally (StikDebug/SideStore etc.) -- that
+# part isn't automated here on purpose.
+
+name: Build Madeira (best-effort)
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 350   # GitHub's hard cap on hosted runners is 360
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Accept Xcode license / install Metal Toolchain
+        run: |
+          sudo xcodebuild -license accept
+          xcodebuild -downloadComponent MetalToolchain
+
+      - name: Install Homebrew deps
+        run: brew install llvm sevenzip cmake ninja meson
+
+      # Cache the slow-to-build toolchains dir + freetype checkout across runs.
+      # Wine and DXMT build products are NOT cached here since they change
+      # whenever you're actively debugging the configure step below.
+      - name: Cache toolchains
+        id: cache-toolchains
+        uses: actions/cache@v4
+        with:
+          path: |
+            toolchains
+            research/freetype
+          key: madeira-toolchains-v1
+
+      - name: Download llvm-mingw
+        if: steps.cache-toolchains.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p toolchains
+          curl -L https://github.com/mstorsjo/llvm-mingw/releases/download/20260421/llvm-mingw-20260421-ucrt-macos-universal.tar.xz \
+            | tar -xJ -C toolchains/
+
+      - name: Build LLVM 15.0.7 for iOS (two-stage)
+        if: steps.cache-toolchains.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch llvmorg-15.0.7 https://github.com/llvm/llvm-project.git toolchains/llvm-project
+          # One-line patch mentioned in build/dxmt-ios/README.md: Apple ld
+          # doesn't accept --gc-sections, only -dead_strip.
+          sed -i '' 's/MATCHES "Darwin"/MATCHES "Darwin|iOS"/' \
+            toolchains/llvm-project/llvm/cmake/modules/AddLLVM.cmake
+
+          # Stage 1: host llvm-tblgen (macOS native)
+          cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-host-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build toolchains/llvm-host-build --target llvm-tblgen
+
+          # Stage 2: iOS target libs, reusing the host tblgen.
+          # UNVERIFIED: LLVM_TARGETS_TO_BUILD may not need to be this broad --
+          # see note at top of file.
+          cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-ios-build -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_TABLEGEN="$PWD/toolchains/llvm-host-build/bin/llvm-tblgen" \
+            -DLLVM_BUILD_UTILS=Off -DLLVM_INCLUDE_TESTS=Off -DLLVM_INCLUDE_EXAMPLES=Off \
+            -DLLVM_TARGETS_TO_BUILD="AArch64;X86"
+          cmake --build toolchains/llvm-ios-build
+
+      - name: Build GnuTLS stack (GMP -> nettle -> GnuTLS)
+        if: steps.cache-toolchains.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p build/gnutls-ios/src
+          curl -L https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz            -o build/gnutls-ios/src/gmp-6.3.0.tar.xz
+          curl -L https://ftp.gnu.org/gnu/nettle/nettle-3.10.1.tar.gz      -o build/gnutls-ios/src/nettle-3.10.1.tar.gz
+          curl -L https://www.gnupg.org/ftp/gcrypt/gnutls/v3.8/gnutls-3.8.9.tar.xz -o build/gnutls-ios/src/gnutls-3.8.9.tar.xz
+          chmod +x build/gnutls-ios/build.sh
+          ./build/gnutls-ios/build.sh
+
+      - name: Build freetype for iOS
+        if: steps.cache-toolchains.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch VER-2-13-3 https://github.com/freetype/freetype.git research/freetype
+          chmod +x build/freetype-ios/build.sh
+          ./build/freetype-ios/build.sh
+
+      - name: "UNVERIFIED: configure wine build-macos + build-arm64ec"
+        continue-on-error: true
+        run: |
+          cd wine
+
+          # build-macos: only consumed here for winebuild + headers/config.h,
+          # not to actually run winelib on the runner -- kept minimal.
+          mkdir -p build-macos && cd build-macos
+          ../configure --disable-tests --disable-winetest \
+            --without-x --without-opengl --without-vulkan
+          make -j"$(sysctl -n hw.ncpu)"
+          cd ..
+
+          # build-arm64ec: the EC PE ntdll cross-build. Adapted from FEX-Emu's
+          # ARM64EC wiki recipe (that one targets Linux, not iOS) -- almost
+          # certainly needs real adjustment.
+          mkdir -p build-arm64ec && cd build-arm64ec
+          ../configure --enable-archs=arm64ec,aarch64,i386 \
+            --with-mingw="${GITHUB_WORKSPACE}/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin/clang" \
+            --disable-tests
+          make -C dlls/ntdll -j"$(sysctl -n hw.ncpu)"
+
+      - name: DXMT - PE side (meson cross-compile)
+        run: |
+          ln -sf ../../toolchains research/dxmt/toolchains
+          cd research/dxmt
+          MINGW_BIN="$(pwd)/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin"
+          SDKROOT="$(xcrun --sdk macosx --show-sdk-path)" \
+            PATH="$MINGW_BIN:/usr/bin:/opt/homebrew/bin:$PATH" \
+            meson setup --cross-file build-aarch64-win.txt --native-file build-osx.txt \
+                        -Dwine_build_path=../../wine/build-macos build-pe
+          SDKROOT="$(xcrun --sdk macosx --show-sdk-path)" \
+            PATH="$MINGW_BIN:/usr/bin:/opt/homebrew/bin:$PATH" \
+            meson compile -C build-pe
+          mkdir -p ../../app/Madeira/aarch64-windows
+          cp build-pe/src/d3d11/d3d11.dll build-pe/src/dxgi/dxgi.dll \
+             build-pe/src/winemetal/winemetal.dll build-pe/src/d3d10/d3d10core.dll \
+             ../../app/Madeira/aarch64-windows/
+
+      - name: DXMT - unix side
+        run: |
+          cd build/dxmt-ios
+          chmod +x build.sh
+          ./build.sh
+          xcrun -sdk iphoneos libtool -static -o libdxmt_combined.a \
+            obj/*.o ../../toolchains/llvm-ios-build/lib/*.a
+          cp libdxmt_combined.a ../../app/Madeira/
+
+      - name: ntdll-unix / wineserver / win32u-unix
+        run: |
+          chmod +x build/ntdll-unix/build.sh build/wineserver/build.sh build/win32u-unix/build.sh
+          ./build/ntdll-unix/build.sh
+          ./build/wineserver/build.sh
+          ./build/win32u-unix/build.sh
+
+      - name: Fetch VC++ runtime DLLs
+        run: |
+          curl -L https://aka.ms/vs/17/release/vc_redist.x64.exe -o /tmp/vc_redist.x64.exe
+          7zz x /tmp/vc_redist.x64.exe -o/tmp/vcredist
+          mkdir -p app/Madeira/x86_64-vcruntime
+          7zz x /tmp/vcredist/.rsrc/1033/CABINET/*.cab -oapp/Madeira/x86_64-vcruntime
+
+      - name: Build app (unsigned) and package .ipa
+        run: |
+          # No shared Xcode scheme is committed to the repo, so `xcodebuild
+          # archive` (which requires -scheme) won't work here. Build the
+          # target directly instead and hand-package the .ipa.
+          xcodebuild -project app/Madeira.xcodeproj -target Madeira \
+            -configuration Release -sdk iphoneos \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO build
+
+          APP_PATH="build/DerivedData/Build/Products/Release-iphoneos/Madeira.app"
+          mkdir -p build/Payload
+          cp -R "$APP_PATH" build/Payload/
+          cd build && zip -qr Madeira-unsigned.ipa Payload
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-unsigned-ipa
+          path: build/Madeira-unsigned.ipa
+          if-no-files-found: warn
