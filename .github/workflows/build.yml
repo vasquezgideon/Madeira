@@ -37,7 +37,10 @@ on:
 
 jobs:
   build:
-    runs-on: macos-15
+    # macos-15's default Xcode (16.4) predates `-downloadComponent` entirely --
+    # that flag needs Xcode 26+. macos-26 went GA in Feb 2026 and defaults to
+    # Xcode 26.6 as of this writing.
+    runs-on: macos-26
     timeout-minutes: 350   # GitHub's hard cap on hosted runners is 360
 
     steps:
@@ -49,7 +52,24 @@ jobs:
       - name: Accept Xcode license / install Metal Toolchain
         run: |
           sudo xcodebuild -license accept
-          xcodebuild -downloadComponent MetalToolchain
+
+          # Some runner images already ship this; Apple's own DTS engineers have
+          # said as much for Xcode Cloud. Check first instead of downloading
+          # unconditionally.
+          if xcodebuild -showComponent metalToolchain >/dev/null 2>&1; then
+            echo "Metal Toolchain already present."
+          else
+            # This specific asset-catalog fetch is known to be flaky even on a
+            # correct Xcode version (Apple developer forums have a long-running
+            # thread of "Failed fetching catalog for assetType
+            # (com.apple.MobileAsset.MetalToolchain)" errors) -- retry a few
+            # times before giving up.
+            for i in 1 2 3; do
+              xcodebuild -downloadComponent MetalToolchain && break
+              echo "Attempt $i/3 failed, retrying in 15s..."
+              sleep 15
+            done
+          fi
 
       - name: Install Homebrew deps
         run: brew install llvm sevenzip cmake ninja meson
@@ -200,3 +220,4 @@ jobs:
           name: Madeira-unsigned-ipa
           path: build/Madeira-unsigned.ipa
           if-no-files-found: warn
+
